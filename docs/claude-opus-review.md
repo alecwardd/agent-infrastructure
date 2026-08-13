@@ -339,6 +339,10 @@ review avoids complicating authentication. The comment carries a
 4. **Verify Actions are enabled** for the repository. No Actions *access* setting
    is needed on `agent-infrastructure` because it is public.
 5. **Test** on one safe PR: apply `review:opus`, confirm the review posts.
+   If the caller was added by merging a PR, prefer a PR opened *after* that
+   merge. Any PR that was already open predates the workflow and needs
+   `gh pr update-branch` first — see
+   [PRs that predate onboarding](#prs-that-predate-onboarding).
 
 The Claude GitHub App is **not** required (§5).
 
@@ -383,6 +387,7 @@ want fully reproducible runs.
 
 | Symptom | Cause and fix |
 | --- | --- |
+| **No run at all on a pre-existing PR** | The PR branched before the caller landed on the default branch. See "PRs that predate onboarding" below — this is the most likely surprise on the first repo you onboard. |
 | Workflow never starts | Label name must be exactly `review:opus`. Check the PR is not a draft and not from a fork. |
 | `Workflow initiated by non-human actor` | The label was applied by a bot. See §12. |
 | Authentication failure | `CLAUDE_CODE_OAUTH_TOKEN` missing or expired. Re-run `claude setup-token` and re-set the secret. |
@@ -391,6 +396,46 @@ want fully reproducible runs.
 | CI tools unavailable | Both `actions: read` in `permissions:` and `additional_permissions: actions: read` are required. |
 | Review truncated | `review_markdown` is capped at 60000 chars when posted (GitHub's limit is 65536). |
 | Two reviews on one PR | The label was applied twice. It is consumed at run start; re-applying is a new request. |
+
+### PRs that predate onboarding
+
+**Symptom:** you apply `review:opus` to an open PR and *nothing happens* — no run,
+no failure, no check. The Actions tab shows no Opus Review run for that PR.
+
+**Cause.** GitHub resolves `pull_request` workflows from the PR's **merge
+commit**, not from the default branch. A PR branched before the caller landed
+has a merge ref computed against the older base, and `opus-review.yml` does not
+exist in that tree. The `labeled` event fires, GitHub finds no matching workflow,
+and discards it silently. Nothing is broken and nothing is logged.
+
+Confirm it in one command — if the listing does not include `opus-review.yml`,
+this is your cause:
+
+```bash
+gh api "repos/OWNER/REPO/contents/.github/workflows?ref=refs/pull/PR/merge" --jq '.[].name'
+```
+
+**Fix.** Refresh the branch so its merge ref is recomputed against current base:
+
+```bash
+gh pr update-branch PR -R OWNER/REPO
+```
+
+Then **remove and re-apply** `review:opus`. The original `labeled` event was
+already consumed; a label sitting on the PR does not re-fire on its own.
+
+> The GitHub UI's "Update branch" button does the same thing, but it is only
+> rendered when the branch is behind *and* either branch protection requires
+> up-to-date branches or the repo has **Settings → General → Pull Requests →
+> "Always suggest updating pull request branches"** enabled. That setting is off
+> by default, so on a fresh repo the button will not be there. The CLI command
+> above works regardless.
+
+**Scope.** This is a one-time wrinkle per repository, affecting only PRs that
+were already open when the caller merged. Any PR branched afterwards picks the
+workflow up automatically. It is worth knowing about before onboarding a repo
+with active PRs, because the failure mode looks like a broken reviewer rather
+than a stale merge ref.
 
 ---
 
