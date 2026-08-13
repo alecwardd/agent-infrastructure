@@ -139,24 +139,45 @@ would defeat the read-only guarantee.
 
 ---
 
-## 6. Permissions
+## 6. Permissions and privilege separation
 
-Declared in both the caller and the shared workflow. A called workflow can only
-*reduce* the caller's grant, never escalate, which is why the caller must declare
-the ceiling.
+**Claude never executes in a job that holds GitHub mutation authority.** The run
+is split into four jobs with disjoint permissions:
+
+| Job | Permissions | Runs Claude? | Does |
+| --- | --- | --- | --- |
+| `claim` | `pull-requests: write` | no | Preflight guards; consume the trigger label; clear stale verdicts |
+| `prepare` | `contents/pull-requests/issues/checks/statuses: read` | no | Stage PR + base-revision context, upload as artifact |
+| `review` | `contents/pull-requests/issues/actions: read` | **yes** | Reason only; emit result artifact |
+| `publish` | `pull-requests: write` | no | Post the review; apply verdict labels; handle errors |
+
+The `review` job holds **no write permission of any kind**. Even a fully
+compromised model in that job cannot comment, label, push, or merge — not
+because it is told not to, but because the token it holds cannot.
+
+The caller declares the *union* as a ceiling; each job downgrades from there. A
+called workflow can only reduce the caller's grant, never escalate, which is why
+the caller must declare the ceiling rather than the minimum.
 
 | Permission | Why |
 | --- | --- |
 | `contents: read` | Check out and read source and git history |
-| `pull-requests: write` | Post the review comment; add/remove `review:*` labels on the PR |
+| `pull-requests: write` | `claim` and `publish` only: review comment and `review:*` labels |
 | `issues: read` | Read the linked specification issue |
 | `actions: read` | Inspect CI runs and job logs (`additional_permissions: actions: read`) |
+| `checks: read`, `statuses: read` | `gh pr checks` resolves `statusCheckRollup`, which spans check runs *and* commit statuses. Both are needed to see third-party reviewers (CodeRabbit, Cursor Bugbot), not just Actions runs |
 
-`contents: write` is **never** granted. `issues: write` is not granted: label
-operations on a pull request are covered by `pull-requests: write`. If a future
-GitHub change makes PR label writes require `issues: write`, the failure surfaces
-loudly in the "Publish review and apply verdict" step rather than silently
-passing.
+`contents: write` is **never** granted anywhere in the pipeline. `issues: write`
+is not granted: label operations on a pull request are covered by
+`pull-requests: write`.
+
+### Result transfer between jobs
+
+The review payload moves from `review` to `publish` as an **artifact**, not a job
+output. A review can approach 40 KB of arbitrary markdown; artifacts impose no
+escaping, expression-interpolation, or size constraints on that content, and
+`download-artifact` is scoped to the current run by default so it needs no extra
+permission. The publisher re-validates the JSON before acting on it.
 
 ---
 
@@ -197,17 +218,36 @@ constructs an API call and there is no injection path through command arguments:
 
 | File | Contents |
 | --- | --- |
+| `base-instructions/` | **Authoritative** repository instructions, from the PR base revision |
 | `pr.json` | PR metadata and changed-file list |
 | `pr.diff` | Complete diff (capped at 1.5 MB, truncation disclosed) |
 | `spec.md` | Linked issue(s), or an explicit "no linked issue" notice |
 | `discussion.md` | Existing PR discussion, including CodeRabbit |
 | `ci.txt` | Deterministic CI check results |
 
-Claude then reads repository-specific instructions in priority order — `AGENTS.md`,
-`CLAUDE.md`, `README.md` — followed by only the architecture docs the diff
-actually touches. Repository conventions override the generic reviewer's
-assumptions. The prompt is domain-neutral: no repository's architecture or
-vocabulary is baked in.
+### Authoritative instructions vs. reviewable content
+
+A pull request must not be able to rewrite the rules that govern its own review.
+`AGENTS.md`, `CLAUDE.md`, and `README.md` are therefore fetched **at the PR base
+revision** by a deterministic step and staged into `base-instructions/`. Only
+those copies carry authority, alongside the prompt itself.
+
+The PR's own versions of those same files stay in the working tree and are
+classified as **data to review, not instructions to obey**. The prompt states
+this explicitly and tells Claude that where the two disagree, the base copy wins
+and the difference is itself something to evaluate. Legitimate improvements to an
+instruction file are reviewed normally and are not findings; changes that weaken
+review obligations, broaden permissions, disable checks, or address an automated
+reviewer are called out.
+
+This complements a protection the action already provides: on pull requests it
+restores `.claude/`, `.mcp.json`, and `CLAUDE.md` from the base branch. That list
+does not include `AGENTS.md` or `README.md`, so staging all three explicitly makes
+the rule uniform rather than dependent on the action's internal list.
+
+Claude then reads only the architecture docs the diff actually touches.
+Repository conventions override the generic reviewer's assumptions. The prompt is
+domain-neutral: no repository's architecture or vocabulary is baked in.
 
 ### Specification retrieval
 
@@ -263,13 +303,16 @@ review avoids complicating authentication. The comment carries a
   for forks — and `pull_request_target` is **deliberately not used**. Using it to
   reach secrets while checking out PR-authored code is the classic pwn-request
   pattern; excluding forks is the honest trade in v1.
+- **Claude holds no write authority.** The job Claude runs in has read-only
+  permissions; a separate job with no Claude execution performs every state
+  change. See §6.
 - **Untrusted input.** The diff, PR body, discussion, and repository files are
-  treated as data, not instruction. The prompt states this explicitly and
-  instructs Claude to report embedded instructions as a P0 prompt-injection
-  finding rather than obey them. The action independently strips HTML comments,
-  invisible characters, and hidden attributes, and restores `.claude/`,
-  `CLAUDE.md`, and `.mcp.json` from the **base** branch so a PR cannot rewrite the
-  reviewer's own configuration.
+  treated as data, not instruction. Instruction files from the PR are explicitly
+  demoted to data, with authoritative copies staged from the base revision (§8).
+  The prompt instructs Claude to report embedded instructions as a P0
+  prompt-injection finding rather than obey them. The action independently strips
+  HTML comments, invisible characters, and hidden attributes, and restores
+  `.claude/`, `CLAUDE.md`, and `.mcp.json` from the **base** branch.
 - **Log hygiene.** `show_full_output` and `display_report` stay at their secure
   defaults (`false`). Public-repository Actions logs are world-readable, so full
   model and tool output is never enabled. Anthropic's subprocess secret-scrubbing

@@ -4,7 +4,10 @@
 # NOTHING in this file needs to be customized per repository.
 #
 # Prerequisites in the consuming repo:
-#   1. Actions secret `CLAUDE_CODE_OAUTH_TOKEN`  (generate with `claude setup-token`)
+#   1. Actions secret `CLAUDE_CODE_OAUTH_TOKEN` — set per repository with
+#      `gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo <owner>/<repo>`.
+#      Personal accounts have no organization-level Actions secrets, so this
+#      secret exists once per participating repository.
 #   2. Labels: review:opus, review:passed, review:changes-requested, review:opus-error
 #
 # Trigger: apply the `review:opus` label to a non-draft, same-repo pull request.
@@ -27,13 +30,18 @@ jobs:
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository
 
-    # A called workflow can only ever reduce these, never escalate, so the
-    # caller must declare the ceiling the reusable workflow needs.
+    # This is the CEILING for the whole pipeline. A called workflow can only
+    # reduce these, never escalate, so the caller must declare the union of what
+    # the reusable workflow's jobs need. Individual jobs downgrade from here:
+    # only the publisher gets `pull-requests: write`, and the job that runs
+    # Claude is read-only.
     permissions:
       contents: read
       pull-requests: write
       issues: read
       actions: read
+      checks: read
+      statuses: read
 
     uses: alecwardd/agent-infrastructure/.github/workflows/reusable-opus-pr-review.yml@v1
     with:

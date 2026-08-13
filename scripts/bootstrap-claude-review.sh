@@ -125,11 +125,16 @@ jobs:
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository
 
+    # Ceiling for the whole pipeline. Individual jobs in the reusable workflow
+    # downgrade from here; only the publisher gets pull-requests: write, and the
+    # job that runs Claude is read-only.
     permissions:
       contents: read
       pull-requests: write
       issues: read
       actions: read
+      checks: read
+      statuses: read
 
     uses: $SHARED_REF
     with:
@@ -152,7 +157,13 @@ Read-only: no contents:write, no commits, no merges."
 
 **Trigger:** apply the \`review:opus\` label to a non-draft, same-repo PR. Never runs on push.
 
-**Permissions:** \`contents: read\` only — this reviewer cannot commit, push, or merge.
+**Secret model:** this is a personal-account rollout. There is no organization-level
+Actions secret and none is used. \`CLAUDE_CODE_OAUTH_TOKEN\` is a **per-repository**
+Actions secret set individually on this repository.
+
+**Permissions:** no \`contents: write\` anywhere. Claude executes in a job with
+read-only GitHub authority; a separate job with no Claude execution posts the
+review and moves labels. This reviewer cannot commit, push, or merge.
 
 CodeRabbit continues to run independently. Human merge authority is unchanged.
 
