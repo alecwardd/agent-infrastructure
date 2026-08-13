@@ -125,9 +125,12 @@ jobs:
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository
 
-    # Ceiling for the whole pipeline. Individual jobs in the reusable workflow
-    # downgrade from here; only the publisher gets pull-requests: write, and the
-    # job that runs Claude is read-only.
+    # The permission ceiling this repository grants. A called workflow can only
+    # reduce these, never escalate, so no job in the reusable workflow can hold
+    # more authority than appears here.
+    #
+    # The guarantee that matters is local and verifiable: there is no
+    # contents: write, so nothing in this pipeline can commit, push, or merge.
     permissions:
       contents: read
       pull-requests: write
@@ -161,9 +164,9 @@ Read-only: no contents:write, no commits, no merges."
 Actions secret and none is used. \`CLAUDE_CODE_OAUTH_TOKEN\` is a **per-repository**
 Actions secret set individually on this repository.
 
-**Permissions:** no \`contents: write\` anywhere. Claude executes in a job with
-read-only GitHub authority; a separate job with no Claude execution posts the
-review and moves labels. This reviewer cannot commit, push, or merge.
+**Permissions:** this repository grants no \`contents: write\`, and a called workflow can only
+reduce that ceiling, never escalate. So this reviewer cannot commit, push, or merge — enforced
+here rather than relying on upstream behaviour.
 
 CodeRabbit continues to run independently. Human merge authority is unchanged.
 

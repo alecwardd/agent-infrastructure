@@ -237,8 +237,18 @@ jobs:
           # Deterministic CI state. Claude may also pull job logs via the
           # github_ci MCP tools, but this snapshot guarantees it cannot claim
           # CI is green without evidence.
-          gh pr checks "$PR" -R "$REPO" > ci.txt 2>&1 || true
-          [ -s ci.txt ] || echo "(no CI checks reported)" > ci.txt
+          gh pr checks "$PR" -R "$REPO" > ci.raw.txt 2>&1 || true
+          [ -s ci.raw.txt ] || echo "(no CI checks reported)" > ci.raw.txt
+
+          # Exclude this review's own pipeline. Its jobs are in-flight by
+          # definition, so leaving them in makes the reviewer read its own
+          # pending/failing check runs as if they were the PR's CI. Matching on
+          # the run id is exact: it drops only this run, not earlier Opus runs.
+          grep -v "/actions/runs/${GITHUB_RUN_ID}/" ci.raw.txt > ci.txt || true
+          [ -s ci.txt ] || echo "(no CI checks other than this review's own pipeline)" > ci.txt
+          printf '\n[Note: check runs belonging to this Opus review pipeline (run %s) were excluded.]\n' \
+            "${GITHUB_RUN_ID}" >> ci.txt
+          rm -f ci.raw.txt
 
       # ----------------------------------------------------------------------
       # AUTHORITATIVE INSTRUCTION STAGING
