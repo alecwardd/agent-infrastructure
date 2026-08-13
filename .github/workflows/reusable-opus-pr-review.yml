@@ -39,10 +39,15 @@ on:
         type: string
         default: "high"
       max_turns:
+        # A deep review of a substantial PR routinely needs 40-60 turns, and the
+        # SDK can overshoot this bound slightly before stopping. The action
+        # treats a successful result whose turn count exceeds the configured
+        # maximum as a failure, so this is set high enough that the guard is not
+        # tripped by ordinary work. Lower it per-caller to cap spend.
         description: "Upper bound on agentic turns."
         required: false
         type: number
-        default: 40
+        default: 80
       timeout_minutes:
         description: "Upper bound on the Claude review step, in minutes."
         required: false
@@ -334,6 +339,14 @@ jobs:
         id: review
         uses: anthropics/claude-code-action@v1
         timeout-minutes: ${{ inputs.timeout_minutes }}
+        # The action fails the step for conditions that do not invalidate the
+        # review itself — most notably its guard on a successful result whose
+        # turn count exceeds `--max-turns`. Discarding a completed review in
+        # that case wastes the entire (expensive) run and leaves the PR with no
+        # feedback. The next step decides the outcome deterministically instead,
+        # so this does NOT weaken fail-closed behaviour: a run with no valid
+        # verdict still fails the job.
+        continue-on-error: true
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # Passing the workflow token stops the action from minting a Claude
@@ -558,17 +571,75 @@ jobs:
       # approach 40 KB of arbitrary markdown, and artifacts impose no escaping,
       # expression-interpolation, or size concerns on that content.
       - name: Persist review result
+        # always() so a completed review is never lost to a failed action step,
+        # and so a failed run still leaves diagnostics behind.
+        if: always()
         env:
           STRUCTURED: ${{ steps.review.outputs.structured_output }}
           CONCLUSION: ${{ steps.review.outputs.conclusion }}
+          EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p review-result
           printf '%s' "${STRUCTURED:-}" > review-result/structured_output.json
           printf '%s' "${CONCLUSION:-unknown}" > review-result/conclusion.txt
 
-          if ! jq -e . review-result/structured_output.json >/dev/null 2>&1; then
-            echo "::error::Claude produced no valid structured output (action conclusion: ${CONCLUSION:-unknown})."
+          valid() {
+            jq -e '.result and .review_markdown and .counts' "$1" >/dev/null 2>&1
+          }
+
+          # ------------------------------------------------------------------
+          # Recovery. When the action fails the step it may never export its
+          # outputs, so fall back to the execution log, which is a JSON array of
+          # SDK messages and carries the same structured_output on the result
+          # message. This is what stops a finished review from being thrown away.
+          # ------------------------------------------------------------------
+          if ! valid review-result/structured_output.json; then
+            if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
+              jq -c '[.[] | select(.type == "result")] | last | .structured_output // empty' \
+                "$EXECUTION_FILE" > /tmp/recovered.json 2>/dev/null || true
+              if valid /tmp/recovered.json; then
+                cp /tmp/recovered.json review-result/structured_output.json
+                echo "::warning::Action step reported failure; recovered a complete structured review from the execution log."
+              fi
+            fi
+          fi
+
+          # ------------------------------------------------------------------
+          # Diagnostics. A strict whitelist of scalar result metadata plus a
+          # short, sanitised error excerpt. Never the prompt, the transcript,
+          # tool results, or repository content — this artifact and this log are
+          # both effectively public.
+          # ------------------------------------------------------------------
+          if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
+            jq '[.[] | select(.type == "result")] | (last // {})
+                | {subtype, is_error, terminal_reason, api_error_status, stop_reason,
+                   duration_ms, duration_api_ms, num_turns, total_cost_usd,
+                   input_tokens: (.usage.input_tokens // null),
+                   output_tokens: (.usage.output_tokens // null),
+                   permission_denials: ((.permission_denials // []) | length),
+                   error_excerpt: (((.result // "") + (((.errors // []) | join("; "))))[0:300])}' \
+              "$EXECUTION_FILE" > review-result/diagnostics.json 2>/dev/null \
+              || echo '{}' > review-result/diagnostics.json
+
+            # Defence in depth: strip anything credential-shaped before it is
+            # printed or uploaded, independently of GitHub's secret masking.
+            sed -E -i \
+              -e 's/(sk-ant-[A-Za-z0-9_-]{4})[A-Za-z0-9_-]+/\1<redacted>/g' \
+              -e 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/\1<redacted>/g' \
+              -e 's/([Bb]earer )[A-Za-z0-9._~+\/-]+=*/\1<redacted>/g' \
+              review-result/diagnostics.json
+            echo "Claude result metadata:"
+            cat review-result/diagnostics.json
+          fi
+
+          # ------------------------------------------------------------------
+          # Fail closed. No valid verdict is still a failure, regardless of what
+          # the action step reported.
+          # ------------------------------------------------------------------
+          if ! valid review-result/structured_output.json; then
+            echo "::error::Claude produced no valid structured review (step outcome: ${REVIEW_OUTCOME:-unknown}, action conclusion: ${CONCLUSION:-unknown})."
             exit 1
           fi
           echo "Structured output captured ($(wc -c < review-result/structured_output.json) bytes)."

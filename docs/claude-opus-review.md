@@ -179,6 +179,46 @@ escaping, expression-interpolation, or size constraints on that content, and
 `download-artifact` is scoped to the current run by default so it needs no extra
 permission. The publisher re-validates the JSON before acting on it.
 
+### A completed review is never discarded
+
+An Opus review is expensive — several dollars and up to ten minutes — so the
+pipeline treats a finished review as something to be preserved even when the
+action step around it fails. The action fails its step for conditions that say
+nothing about the quality of the review, most notably its guard on a successful
+result whose turn count exceeded `--max-turns`. Losing the review in that case
+means paying full price for no feedback.
+
+So the Claude step runs `continue-on-error: true`, and the next step decides the
+outcome itself. It prefers the action's `structured_output` output and, when the
+failed step never exported one, recovers the same payload from the execution log
+(`execution_file`, a JSON array of SDK messages whose result message carries
+`structured_output`).
+
+**This does not weaken fail-closed behaviour.** The verdict is still gated on a
+structurally valid review — `result`, `review_markdown`, and `counts` must all be
+present — and a run without one fails the job, applies `review:opus-error`, and
+posts the "did not complete" comment exactly as before. What changed is that the
+*deterministic* layer decides, rather than an action-side error the pipeline
+cannot interpret.
+
+### Failure diagnostics
+
+The same step writes `diagnostics.json` into the result artifact: a strict
+whitelist of scalar result metadata — `subtype`, `is_error`, `terminal_reason`,
+`api_error_status`, `stop_reason`, durations, `num_turns`, `total_cost_usd`,
+input/output token counts, a permission-denial *count*, and a 300-character
+error excerpt with credential-shaped strings redacted.
+
+Never included: the prompt, the transcript, assistant messages, tool results, or
+any repository content. Both the Actions log and the artifact are effectively
+public on a public repository, so the whitelist is deliberately narrow and the
+raw execution file is never uploaded — it contains the entire review transcript.
+`show_full_output` remains off for the same reason.
+
+`api_error_status` and `terminal_reason` are the two fields that identify an
+authentication or quota rejection immediately, which the action's own error
+message does not.
+
 ---
 
 ## 7. Claude configuration
@@ -188,7 +228,7 @@ permission. The publisher re-validates the JSON before acting on it.
 | Action | `anthropics/claude-code-action@v1` | Current major; v1 inputs only, no deprecated ones |
 | Model | `--model opus` | Alias tracks the latest Opus rather than pinning a stale dated id |
 | Effort | `--effort high` | Deep reasoning without the unbounded cost of `max` |
-| Turns | `--max-turns 40` | Enough for a real multi-file investigation; bounded |
+| Turns | `--max-turns 80` | A deep multi-file review routinely needs 40-60; the action fails a run whose turn count exceeds this bound, so headroom matters. Lower per-caller to cap spend |
 | Step timeout | 30 min (configurable) | Job carries a hard 60-minute ceiling regardless |
 | Mode | agent (implied by `prompt`) | Tag mode would auto-grant `git commit`/`git push` tools |
 
@@ -390,7 +430,9 @@ want fully reproducible runs.
 | **No run at all on a pre-existing PR** | The PR branched before the caller landed on the default branch. See "PRs that predate onboarding" below — this is the most likely surprise on the first repo you onboard. |
 | Workflow never starts | Label name must be exactly `review:opus`. Check the PR is not a draft and not from a fork. |
 | `Workflow initiated by non-human actor` | The label was applied by a bot. See §12. |
-| Authentication failure | `CLAUDE_CODE_OAUTH_TOKEN` missing or expired. Re-run `claude setup-token` and re-set the secret. |
+| Authentication failure | `CLAUDE_CODE_OAUTH_TOKEN` missing, expired, or **invalidated by a later `claude setup-token` run**. Issuing a new token can revoke the stored one, so the reviewer keeps working until the next PR and then fails. Diagnose from the `diagnostics.json` in the `opus-review-result` artifact: `api_error_status: 401` with `terminal_reason: api_error`, `num_turns: 1`, and `total_cost_usd: 0` is exactly this. Re-run `claude setup-token`, verify it locally, then re-set the secret. |
+| `did not return structured_output` | A symptom, never the cause. The action emits this whenever the result is flagged as an error, regardless of whether structured output existed. Read `diagnostics.json` for the real reason. |
+| `exceeding the configured maximum of N` turns | The SDK can overshoot `--max-turns`, and the action fails a successful result whose turn count exceeds it. The review itself is fine and is recovered from the execution log rather than discarded; raise `max_turns` for that caller. |
 | `review:opus-error` applied | The run failed or timed out. **Not a pass.** Check the run log, then re-apply `review:opus`. |
 | Label step 403s | Confirm the caller declares `pull-requests: write`; a called workflow cannot escalate beyond it. |
 | CI tools unavailable | Both `actions: read` in `permissions:` and `additional_permissions: actions: read` are required. |
