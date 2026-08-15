@@ -532,6 +532,26 @@ jobs:
 
             Return your result through the structured output schema.
 
+            The publisher copies `review_markdown` onto the pull request as the
+            review body. It is the only field humans read. Fill it with the
+            complete review text.
+
+            NEVER set `review_markdown` to a pointer such as
+            "(see structured field)", "see structured_output", "n/a", or
+            similar. That string is Claude Code's own placeholder for its
+            *text result* when structured output exists. If you copy it into
+            `review_markdown`, the pull request receives an empty review and
+            the findings are lost.
+
+            Do not call Write, Edit, or any other file-mutation tool. Those
+            tools are denied. There is no file to write. The StructuredOutput
+            fields are the only delivery path.
+
+            Also fill `findings` with one object per P0/P1/P2 finding
+            (`severity`, `location`, `problem`, `failure_mode`, `why`, `fix`)
+            so a stubbed markdown field can still be reconstructed. P3 items
+            stay in the markdown list only.
+
             `review_markdown` must be the complete human-readable review, ending
             with this summary block:
 
@@ -555,9 +575,11 @@ jobs:
 
             Set the `result` field to the same verdict, and fill `counts` with
             the number of findings at each severity. `spec_issue` should be the
-            linked issue reference (for example "#10") or "none".
+            linked issue reference (for example "#10") or "none". `findings`
+            must contain exactly `counts.p0 + counts.p1 + counts.p2` items.
 
-            Keep `review_markdown` under 40000 characters.
+            Keep `review_markdown` under 40000 characters. It must be at least
+            300 characters (the required summary block plus the marker).
           claude_args: |
             --model ${{ inputs.model }}
             --effort ${{ inputs.effort }}
@@ -565,7 +587,7 @@ jobs:
             --add-dir /tmp/review-context
             --allowedTools "Read,Glob,Grep,LS,Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git blame:*),Bash(git status),Bash(git rev-parse:*),mcp__github_ci__get_ci_status,mcp__github_ci__get_workflow_run_details,mcp__github_ci__download_job_log"
             --disallowedTools "Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Bash(git push:*),Bash(git commit:*),Bash(git add:*),Bash(git rm:*),Bash(gh:*),Bash(curl:*),Bash(rm:*)"
-            --json-schema '{"type":"object","properties":{"result":{"type":"string","enum":["PASS","CHANGES_REQUESTED"]},"review_markdown":{"type":"string"},"spec_issue":{"type":"string"},"counts":{"type":"object","properties":{"p0":{"type":"integer"},"p1":{"type":"integer"},"p2":{"type":"integer"},"p3":{"type":"integer"}},"required":["p0","p1","p2","p3"]}},"required":["result","review_markdown","counts"]}'
+            --json-schema '{"type":"object","properties":{"result":{"type":"string","enum":["PASS","CHANGES_REQUESTED"]},"review_markdown":{"type":"string","minLength":300},"spec_issue":{"type":"string"},"counts":{"type":"object","properties":{"p0":{"type":"integer"},"p1":{"type":"integer"},"p2":{"type":"integer"},"p3":{"type":"integer"}},"required":["p0","p1","p2","p3"]},"findings":{"type":"array","items":{"type":"object","properties":{"severity":{"type":"string","enum":["P0","P1","P2","P3"]},"location":{"type":"string"},"problem":{"type":"string"},"failure_mode":{"type":"string"},"why":{"type":"string"},"fix":{"type":"string"}},"required":["severity","problem"]}}},"required":["result","review_markdown","counts"]}'
 
       # An artifact carries the payload rather than a job output: the review can
       # approach 40 KB of arbitrary markdown, and artifacts impose no escaping,
@@ -585,8 +607,82 @@ jobs:
           printf '%s' "${STRUCTURED:-}" > review-result/structured_output.json
           printf '%s' "${CONCLUSION:-unknown}" > review-result/conclusion.txt
 
-          valid() {
-            jq -e '.result and .review_markdown and .counts' "$1" >/dev/null 2>&1
+          # Shape: the JSON has the required keys. Usable: review_markdown is a
+          # real review, not Claude Code's "(see structured field)" pointer.
+          # the-desk#41 run 31912273814 posted counts (P2=4) with that stub as
+          # the body because the old check treated any non-empty string as valid.
+          cat > /tmp/opus-has-shape.jq <<'JQ'
+          .result and .review_markdown and .counts
+          JQ
+          cat > /tmp/opus-usable.jq <<'JQ'
+          def trim: gsub("^\\s+|\\s+$"; "");
+          def md: (.review_markdown // "") | trim;
+          def stub:
+            md as $text
+            | ($text | ascii_downcase)
+              | test("^(see structured field|\\(see structured field\\)|see structured_output|\\(see structured_output\\)|see structured output|n/a|todo|tbd)$") as $ptr
+            | $ptr
+              or (($text | length) < 80)
+              or (($text | test("CLAUDE_REVIEW_RESULT:")) | not);
+          def has_marker:
+            md | test("CLAUDE_REVIEW_RESULT:\\s*(PASS|CHANGES_REQUESTED)");
+          def blocking: ((.counts.p0 // 0) + (.counts.p1 // 0) + (.counts.p2 // 0));
+          def has_finding_body:
+            blocking == 0
+            or (md | test("Severity:"))
+            or ((.findings // []) | length) > 0;
+          (.result == "PASS" or .result == "CHANGES_REQUESTED")
+          and (.counts | type == "object")
+          and (.counts | has("p0") and has("p1") and has("p2") and has("p3"))
+          and (md | length) > 0
+          and (stub | not)
+          and has_marker
+          and has_finding_body
+          JQ
+          cat > /tmp/opus-hydrate.jq <<'JQ'
+          def trim: gsub("^\\s+|\\s+$"; "");
+          def md: (.review_markdown // "") | trim;
+          def stub:
+            md as $text
+            | ($text | ascii_downcase)
+              | test("^(see structured field|\\(see structured field\\)|see structured_output|\\(see structured_output\\)|see structured output|n/a|todo|tbd)$") as $ptr
+            | $ptr
+              or (($text | length) < 80)
+              or (($text | test("CLAUDE_REVIEW_RESULT:")) | not);
+          def rendered:
+            ((.findings // [])
+             | map(
+                 "Severity: \(.severity // "P2")\n" +
+                 "Location: \(.location // "unspecified")\n" +
+                 "Problem: \(.problem // "")\n" +
+                 "Concrete failure mode: \(.failure_mode // .problem // "")\n" +
+                 "Why it matters: \(.why // "")\n" +
+                 "Smallest recommended correction: \(.fix // "")"
+               )
+             | join("\n\n"));
+          if stub and ((.findings // []) | length) > 0 then
+            .review_markdown = (rendered + "\n\nCLAUDE_REVIEW_RESULT: " + .result)
+          else .
+          end
+          JQ
+          cat > /tmp/opus-assistant.jq <<'JQ'
+          def texts:
+            .[]?
+            | select(.type == "assistant")
+            | (.message.content // .content // [])
+            | if type == "array" then .[] elif type == "object" then . else empty end
+            | select(.type == "text")
+            | .text // empty;
+          [texts]
+          | map(select(test("CLAUDE_REVIEW_RESULT:|Merge assessment:|Severity:")))
+          | if length == 0 then empty else max_by(length) end
+          JQ
+
+          has_shape() {
+            jq -e -f /tmp/opus-has-shape.jq "$1" >/dev/null 2>&1
+          }
+          usable() {
+            jq -e -f /tmp/opus-usable.jq "$1" >/dev/null 2>&1
           }
 
           # ------------------------------------------------------------------
@@ -595,13 +691,41 @@ jobs:
           # SDK messages and carries the same structured_output on the result
           # message. This is what stops a finished review from being thrown away.
           # ------------------------------------------------------------------
-          if ! valid review-result/structured_output.json; then
+          if ! has_shape review-result/structured_output.json; then
             if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
               jq -c '[.[] | select(.type == "result")] | last | .structured_output // empty' \
                 "$EXECUTION_FILE" > /tmp/recovered.json 2>/dev/null || true
-              if valid /tmp/recovered.json; then
+              if has_shape /tmp/recovered.json; then
                 cp /tmp/recovered.json review-result/structured_output.json
-                echo "::warning::Action step reported failure; recovered a complete structured review from the execution log."
+                echo "::warning::Action step reported failure; recovered structured output from the execution log."
+              fi
+            fi
+          fi
+
+          # ------------------------------------------------------------------
+          # Hydrate a stubbed review_markdown. Claude Code's text result is
+          # often "(see structured field)" meaning "look at structured_output".
+          # The model sometimes copies that pointer into review_markdown, which
+          # is itself a structured field — the publisher then posts an empty
+          # review. Prefer the findings array; then the assistant transcript.
+          # The raw execution file is still never uploaded.
+          # ------------------------------------------------------------------
+          if has_shape review-result/structured_output.json && ! usable review-result/structured_output.json; then
+            jq -c -f /tmp/opus-hydrate.jq review-result/structured_output.json \
+              > /tmp/hydrated.json 2>/dev/null || true
+            if usable /tmp/hydrated.json; then
+              cp /tmp/hydrated.json review-result/structured_output.json
+              echo "::warning::review_markdown was a placeholder; reconstructed it from the findings array."
+            elif [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
+              jq -r -f /tmp/opus-assistant.jq "$EXECUTION_FILE" \
+                > /tmp/assistant-review.md 2>/dev/null || true
+              if [ -s /tmp/assistant-review.md ]; then
+                jq -c --rawfile md /tmp/assistant-review.md '.review_markdown = $md' \
+                  review-result/structured_output.json > /tmp/hydrated.json 2>/dev/null || true
+                if usable /tmp/hydrated.json; then
+                  cp /tmp/hydrated.json review-result/structured_output.json
+                  echo "::warning::review_markdown was a placeholder; recovered the review from the assistant transcript."
+                fi
               fi
             fi
           fi
@@ -635,11 +759,13 @@ jobs:
           fi
 
           # ------------------------------------------------------------------
-          # Fail closed. No valid verdict is still a failure, regardless of what
-          # the action step reported.
+          # Fail closed. A payload whose review_markdown is Claude Code's
+          # "(see structured field)" pointer is not a review: posting it would
+          # apply review:changes-requested with no findings. That is worse than
+          # an error label.
           # ------------------------------------------------------------------
-          if ! valid review-result/structured_output.json; then
-            echo "::error::Claude produced no valid structured review (step outcome: ${REVIEW_OUTCOME:-unknown}, action conclusion: ${CONCLUSION:-unknown})."
+          if ! usable review-result/structured_output.json; then
+            echo "::error::Claude produced no usable review (step outcome: ${REVIEW_OUTCOME:-unknown}, action conclusion: ${CONCLUSION:-unknown}). review_markdown must contain the full review and CLAUDE_REVIEW_RESULT, not a placeholder such as '(see structured field)'."
             exit 1
           fi
           echo "Structured output captured ($(wc -c < review-result/structured_output.json) bytes)."
@@ -704,6 +830,27 @@ jobs:
           if [ "$result" != "PASS" ] && [ "$result" != "CHANGES_REQUESTED" ]; then
             echo "::error::Unrecognized review result '$result'."
             exit 1
+          fi
+
+          md=$(jq -r '.review_markdown // empty' review-result/structured_output.json)
+          md_norm=$(printf '%s' "$md" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          case "$md_norm" in
+            "(see structured field)"|"see structured field"|"see structured_output"|"n/a"|"todo"|"tbd"|"")
+              echo "::error::review_markdown is a placeholder ('$md_norm'), not a review. Refusing to post a verdict."
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$md" | grep -qE 'CLAUDE_REVIEW_RESULT: (PASS|CHANGES_REQUESTED)'; then
+            echo "::error::review_markdown is missing the CLAUDE_REVIEW_RESULT marker. Refusing to post a verdict."
+            exit 1
+          fi
+          blocking=$((p0 + p1 + p2))
+          if [ "$blocking" -gt 0 ] && ! printf '%s' "$md" | grep -q 'Severity:'; then
+            finding_n=$(jq -r '(.findings // []) | length' review-result/structured_output.json)
+            if [ "$finding_n" = "0" ]; then
+              echo "::error::CHANGES_REQUESTED with P0/P1/P2 counts but no finding body. Refusing to post a verdict."
+              exit 1
+            fi
           fi
 
           # Cross-check the model against itself: PASS with blocking findings is
