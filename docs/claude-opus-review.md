@@ -179,6 +179,48 @@ escaping, expression-interpolation, or size constraints on that content, and
 `download-artifact` is scoped to the current run by default so it needs no extra
 permission. The publisher re-validates the JSON before acting on it.
 
+### A completed review is never discarded
+
+An Opus review is expensive — several dollars and up to ten minutes — so the
+pipeline treats a finished review as something to be preserved even when the
+action step around it fails. The action fails its step for conditions that say
+nothing about the quality of the review, most notably its guard on a successful
+result whose turn count exceeded `--max-turns`. Losing the review in that case
+means paying full price for no feedback.
+
+So the Claude step runs `continue-on-error: true`, and the next step decides the
+outcome itself. It prefers the action's `structured_output` output and, when the
+failed step never exported one, recovers the same payload from the execution log
+(`execution_file`, a JSON array of SDK messages whose result message carries
+`structured_output`).
+
+**This does not weaken fail-closed behaviour.** The verdict is still gated on a
+usable review — `result` and `counts` present, and `review_markdown` a real
+review that contains `CLAUDE_REVIEW_RESULT`, not Claude Code's
+`(see structured field)` pointer. A run without one fails the job, applies
+`review:opus-error`, and posts the "did not complete" comment exactly as
+before. Counts without a body never become `review:changes-requested`. What
+changed is that the *deterministic* layer decides, rather than an action-side
+error the pipeline cannot interpret.
+
+### Failure diagnostics
+
+The same step writes `diagnostics.json` into the result artifact: a strict
+whitelist of scalar result metadata — `subtype`, `is_error`, `terminal_reason`,
+`api_error_status`, `stop_reason`, durations, `num_turns`, `total_cost_usd`,
+input/output token counts, a permission-denial *count*, and a 300-character
+error excerpt with credential-shaped strings redacted.
+
+Never included: the prompt, the transcript, assistant messages, tool results, or
+any repository content. Both the Actions log and the artifact are effectively
+public on a public repository, so the whitelist is deliberately narrow and the
+raw execution file is never uploaded — it contains the entire review transcript.
+`show_full_output` remains off for the same reason.
+
+`api_error_status` and `terminal_reason` are the two fields that identify an
+authentication or quota rejection immediately, which the action's own error
+message does not.
+
 ---
 
 ## 7. Claude configuration
@@ -188,7 +230,7 @@ permission. The publisher re-validates the JSON before acting on it.
 | Action | `anthropics/claude-code-action@v1` | Current major; v1 inputs only, no deprecated ones |
 | Model | `--model opus` | Alias tracks the latest Opus rather than pinning a stale dated id |
 | Effort | `--effort high` | Deep reasoning without the unbounded cost of `max` |
-| Turns | `--max-turns 40` | Enough for a real multi-file investigation; bounded |
+| Turns | `--max-turns 80` | A deep multi-file review routinely needs 40-60; the action fails a run whose turn count exceeds this bound, so headroom matters. Lower per-caller to cap spend |
 | Step timeout | 30 min (configurable) | Job carries a hard 60-minute ceiling regardless |
 | Mode | agent (implied by `prompt`) | Tag mode would auto-grant `git commit`/`git push` tools |
 
@@ -275,22 +317,41 @@ action's supported `structured_output` output — no console-log scraping:
 { "result": "PASS | CHANGES_REQUESTED",
   "review_markdown": "...",
   "spec_issue": "#10",
-  "counts": { "p0": 0, "p1": 0, "p2": 0, "p3": 2 } }
+  "counts": { "p0": 0, "p1": 0, "p2": 0, "p3": 2 },
+  "findings": [ { "severity": "P2", "location": "path:line",
+                  "problem": "...", "failure_mode": "...",
+                  "why": "...", "fix": "..." } ] }
 ```
 
 `review_markdown` also ends with the human-readable marker
 `CLAUDE_REVIEW_RESULT: PASS` / `CHANGES_REQUESTED`, so the verdict is visible in
-the comment as well as machine-readable.
+the comment as well as machine-readable. The schema requires
+`review_markdown.minLength: 300` so Claude Code's own text-result placeholder
+`(see structured field)` cannot validate. `findings` is optional in the schema
+but required in practice whenever `counts.p0 + p1 + p2 > 0`: it is the fallback
+the publisher uses if markdown is stubbed.
 
-The deterministic layer cross-checks the model against itself: a `PASS` reported
-alongside any P0/P1/P2 count is downgraded to `CHANGES_REQUESTED` with a warning.
+The deterministic layer cross-checks the model against itself:
+
+- a `PASS` reported alongside any P0/P1/P2 count is downgraded to
+  `CHANGES_REQUESTED` with a warning
+- a `review_markdown` that is empty, shorter than 80 characters, missing
+  `CLAUDE_REVIEW_RESULT`, or equal to `(see structured field)` is **not a
+  review**. The persist step tries to reconstruct the body from `findings`,
+  then from the assistant transcript in the execution log. If that still fails,
+  the job fails, `review:opus-error` is applied, and **no verdict label is
+  posted**. Counts without a body must not become `review:changes-requested`.
+
 Severity taxonomy and the six-field finding format live in the shared prompt.
 
 ### Output shape
 
-One top-level review comment per run. Inline comments are deliberately not used
-in v1 — one finding should not become five notifications, and a clean top-level
-review avoids complicating authentication. The comment carries a
+One top-level review comment per run. **Inline comments are deliberately not
+used in v1** — one finding should not become five notifications, a clean
+top-level review avoids complicating authentication, and the review job holds
+no `pull-requests: write` so it cannot post them even if the model tried.
+`classify_inline_comments: "false"` skips the action's post-run inline-comment
+step so no write-path step runs in the read-only job. The comment carries a
 `<!-- claude-opus-review -->` marker for future de-duplication.
 
 ---
@@ -356,6 +417,12 @@ draft PR, responds to CI, and — when implementation is substantially complete 
 applies `review:opus`. It then reads the review comment, addresses valid
 findings, pushes, and may re-request review by re-applying the label.
 
+If the review comment is empty, is literally `(see structured field)`, or the
+PR only carries `review:opus-error`, **there are no findings to implement**.
+Do not invent P2s from the counts, do not merge, and do not re-apply
+`review:opus` from a Cursor cloud agent — that label is a human (or
+user-token) action. See the troubleshooting row for `(see structured field)`.
+
 > **One constraint to know:** the action refuses to run for non-human actors. If
 > Cursor applies the label via a GitHub App identity (e.g. `cursor[bot]`), the run
 > fails the actor check. Either have Cursor act through a user-authenticated
@@ -390,8 +457,12 @@ want fully reproducible runs.
 | **No run at all on a pre-existing PR** | The PR branched before the caller landed on the default branch. See "PRs that predate onboarding" below — this is the most likely surprise on the first repo you onboard. |
 | Workflow never starts | Label name must be exactly `review:opus`. Check the PR is not a draft and not from a fork. |
 | `Workflow initiated by non-human actor` | The label was applied by a bot. See §12. |
-| Authentication failure | `CLAUDE_CODE_OAUTH_TOKEN` missing or expired. Re-run `claude setup-token` and re-set the secret. |
+| Authentication failure | `CLAUDE_CODE_OAUTH_TOKEN` missing, expired, or **invalidated by a later `claude setup-token` run**. Issuing a new token can revoke the stored one, so the reviewer keeps working until the next PR and then fails. Diagnose from the `diagnostics.json` in the `opus-review-result` artifact: `api_error_status: 401` with `terminal_reason: api_error`, `num_turns: 1`, and `total_cost_usd: 0` is exactly this. Re-run `claude setup-token`, verify it locally, then re-set the secret. |
+| `did not return structured_output` | A symptom, never the cause. The action emits this whenever the result is flagged as an error, regardless of whether structured output existed. Read `diagnostics.json` for the real reason. |
+| `exceeding the configured maximum of N` turns | The SDK can overshoot `--max-turns`, and the action fails a successful result whose turn count exceeds it. The review itself is fine and is recovered from the execution log rather than discarded; raise `max_turns` for that caller. |
 | `review:opus-error` applied | The run failed or timed out. **Not a pass.** Check the run log, then re-apply `review:opus`. |
+| Comment body is `(see structured field)` | The model copied Claude Code's text-result placeholder into `review_markdown`. The publisher used to post that stub and apply `review:changes-requested` from the counts alone (the-desk#41 run 31912273814: P2=4, no findings, no inline comments). It now rejects the stub: reconstruct from `findings` or the assistant transcript, otherwise fail closed with `review:opus-error`. Re-apply `review:opus` after this fix is on `v1`. Do not invent the missing findings. |
+| No inline review comments | Expected. v1 posts one top-level comment; inline comments are disabled (`classify_inline_comments: false`) and the review job cannot write to the pull request. |
 | Label step 403s | Confirm the caller declares `pull-requests: write`; a called workflow cannot escalate beyond it. |
 | CI tools unavailable | Both `actions: read` in `permissions:` and `additional_permissions: actions: read` are required. |
 | Review truncated | `review_markdown` is capped at 60000 chars when posted (GitHub's limit is 65536). |
