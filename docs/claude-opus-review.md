@@ -66,8 +66,13 @@ if: >-
   github.event.pull_request.head.repo.full_name == github.repository
 ```
 
-Opus does **not** run on push, on every commit, or on comments. It runs when the
-`review:opus` label is applied and at no other time. The shared workflow
+Opus does **not** run on push or every commit. The label route above remains
+available. A caller can also opt in to `issue_comment: created`, gated on
+`CLAUDE_REVIEW_ENABLED == true`, a PR comment, and the repository owner's login.
+Pass `request_comment_id` and the issue/PR number; the shared workflow verifies
+the comment ID, owner, PR URL, and exact `@claude` / `@claude review` grammar
+(case-insensitive). Other comments and ineligible PRs are no-ops before Claude.
+Mentions request review only, never arbitrary code implementation. The shared workflow
 re-verifies open/non-draft/non-fork itself, so a misconfigured caller cannot
 bypass the guards.
 
@@ -227,8 +232,8 @@ message does not.
 
 | Setting | Value | Rationale |
 | --- | --- | --- |
-| Action | `anthropics/claude-code-action@v1` | Current major; v1 inputs only, no deprecated ones |
-| Model | `--model opus` | Alias tracks the latest Opus rather than pinning a stale dated id |
+| Action | `anthropics/claude-code-action@6c690188da61cf16ee7debb28383ba67f02abb4c` | Immutable reviewed action; installs CLI 2.1.290 |
+| Model | caller input; default `opus` | Desk explicitly requests `claude-opus-5-5`; configuration is distinct from observed model identity |
 | Effort | `--effort high` | Deep reasoning without the unbounded cost of `max` |
 | Turns | `--max-turns 80` | A deep multi-file review routinely needs 40-60; the action fails a run whose turn count exceeds this bound, so headroom matters. Lower per-caller to cap spend |
 | Step timeout | 30 min (configurable) | Job carries a hard 60-minute ceiling regardless |
@@ -240,16 +245,16 @@ mode, which grants nothing implicitly.
 
 ### Tool policy
 
-Allowed: `Read`, `Glob`, `Grep`, `LS`, read-only git
-(`git log/show/diff/blame/status/rev-parse`), and the three `mcp__github_ci__*`
-tools for CI inspection.
+Available to the model: `Read`, `Glob` and `Grep` only. Safe/restricted
+mode suppresses repository customizations, and all model MCP tools are denied.
+There is no model shell, code-editing, test-execution or publication tool.
+`Read` deny patterns exclude .git, .env, private/data/recordings and trader-memory
+paths; these are tool controls rather than a comprehensive OS isolation proof.
 
-Denied: `Edit`, `MultiEdit`, `Write`, `NotebookEdit`, `WebFetch`, `WebSearch`,
-and `Bash(git push|commit|add|rm)`, `Bash(gh:*)`, `Bash(curl:*)`, `Bash(rm:*)`.
-`--disallowedTools` takes precedence over any allow rule.
-
-Claude needs no network and no GitHub token because all GitHub context is
-pre-staged into `/tmp/review-context` by deterministic steps (see §8).
+The action wrapper receives the review job's read-only GitHub token for bootstrap;
+source/CI context is staged by deterministic steps. Publication has a separate
+token/job and no Claude execution. Model/API credentials are never deliberately
+included in review source or report artifacts.
 
 ---
 
@@ -519,3 +524,66 @@ overwrite an existing `opus-review.yml`.
 
 Do not mass-roll out before the pilot has produced a real review. Order:
 pilot repository → confirm end to end → then batch the rest.
+
+
+## On-demand review boundaries
+
+The Desk caller supports an owner-only mention route behind its enable variable.
+Its shared-workflow ref must be replaced with the immutable reviewed publication
+commit before deployment. Do not move `v1` to roll out this change implicitly.
+The existing OAuth secret is used without API-key fallback; token validity and
+subscription/extra-usage settings must be checked through an owner-approved use.
+No new GitHub App, broader token, settings change or model invocation is implied
+by landing a disabled caller. Enablement, source export and usage remain owner
+decisions; the existing Actions-minutes and manual-merge holds still apply.
+
+Preparation freezes head/base and stages their immutable compare. Review checks
+out that exact head explicitly; issue-comment events otherwise point at the
+default branch. Root AGENTS.md, AGENT.md, CLAUDE.md and README are staged from the
+base. Safe/restricted mode and the Read/Glob/Grep tool set permit source inspection
+and search without code edits, shell execution, tests or publication. Repository
+content and PR discussion cannot grant additional authority.
+
+The existing review rubric includes explicit Test changes and unchanged regression
+obligations. Missing evidence is UNABLE_TO_VERIFY. A fresh Claude review can qualify
+for Codex preparation, subject to actual candidate/test/packet contributions; a
+Claude preparer requires a different-family reviewer. Dependabot authorship alone
+does not establish family independence. Unknown attribution remains unverified.
+
+Original action output, selected original structured report, original markdown
+when available, and requested versus SDK/provider-reported model/session metadata
+are retained before placeholder recovery. Full execution transcripts are not
+uploaded. Reports remain advisory until their scope, model evidence, independence
+and freshness are assessed. The publisher has separate PR write authority and no
+Claude execution. Both success and failure publication recheck open/head/base;
+stale results retain artifacts without publishing a current verdict. Mention
+reports add no verdict labels or merge gate. Legacy labels remain advisory and
+must never substitute for revision/freshness checks after a later head change.
+
+Result artifacts expire after 30 days. The Director writer must retain or durably
+reference the original report with its digest and exact candidate binding in the
+existing ledger before expiry. Workflow completion is not merge authorization.
+
+### Offline validation
+
+`python -B scripts/test_review_workflow.py` executes fixtures against the Python
+embedded in this workflow: authorized and unrelated mentions, PR eligibility,
+exact-head/base freshness, action failure, SDK recovery, original retention and
+the job/tool boundary. It does not contact GitHub or invoke Claude. YAML and Bash
+syntax checks complement these fixtures. A controlled owner-approved first live
+invocation is still required to verify CLI/SDK behavior, token health, actual
+model identity and the separate publication route.
+
+
+Mention callers must apply the exact static @claude / @claude review allowlist
+before calling this reusable workflow. This prevents unrelated mentions from
+entering its workflow-level concurrency group and cancelling an active review.
+The shared preflight repeats authorization and grammar checks before model work.
+Original report selection matches the existing jq recovery predicate for null/
+false action fields. Publication validates nonnegative bounded integer counts
+before any shell arithmetic, then performs its final head/base/state readback
+immediately before posting the revision-bound report.
+
+The optional consumer fixture uses DESK_CALLER_PATH to check that caller boundary;
+without a sibling Desk checkout it is explicitly skipped, leaving shared tests
+portable. Hosted execution and the CLI/tool enforcement remain untested locally.

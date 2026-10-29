@@ -35,7 +35,7 @@ Cursor implementation agent  →  draft PR  →  deterministic CI
       ↓
 implementation substantially complete
       ↓
-apply label `review:opus`
+apply label `review:opus` (or owner @claude when enabled)
       ↓
 Claude Opus deep review  ──→  PASS               → review:passed        → human merges
                          └──→ CHANGES_REQUESTED  → review:changes-requested → Cursor fixes → re-label
