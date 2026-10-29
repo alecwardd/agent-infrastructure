@@ -28,6 +28,11 @@ on:
         description: "Pull request number to review."
         required: true
         type: number
+      request_comment_id:
+        description: "Owner mention comment ID, or zero for the legacy label route."
+        required: false
+        type: number
+        default: 0
       model:
         description: "Claude model alias or full model id."
         required: false
@@ -96,6 +101,7 @@ jobs:
     permissions:
       pull-requests: write
     outputs:
+      accepted: ${{ steps.preflight.outputs.accepted }}
       head_sha: ${{ steps.preflight.outputs.head_sha }}
       base_sha: ${{ steps.preflight.outputs.base_sha }}
     steps:
@@ -105,40 +111,49 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ inputs.pr_number }}
+          REQUEST_COMMENT_ID: ${{ inputs.request_comment_id }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_SNAPSHOT: /tmp/pr-api.json
+          REQUEST_SNAPSHOT: /tmp/review-request.json
         run: |
           set -euo pipefail
-          gh pr view "$PR" -R "$REPO" \
-            --json number,isDraft,state,headRepositoryOwner,headRefOid,baseRefOid \
-            > /tmp/pr-preflight.json
-
-          state=$(jq -r '.state' /tmp/pr-preflight.json)
-          draft=$(jq -r '.isDraft' /tmp/pr-preflight.json)
-          head_owner=$(jq -r '.headRepositoryOwner.login // ""' /tmp/pr-preflight.json)
-          head_sha=$(jq -r '.headRefOid' /tmp/pr-preflight.json)
-          base_sha=$(jq -r '.baseRefOid' /tmp/pr-preflight.json)
-          repo_owner="${REPO%%/*}"
-
-          if [ "$state" != "OPEN" ]; then
-            echo "::error::PR #$PR is $state. Refusing to review a closed pull request."
-            exit 1
+          gh api "repos/${REPO}/pulls/${PR}" > "$PR_SNAPSHOT"
+          if [ "$REQUEST_COMMENT_ID" != "0" ]; then
+            gh api "repos/${REPO}/issues/comments/${REQUEST_COMMENT_ID}" > "$REQUEST_SNAPSHOT"
           fi
-          if [ "$draft" = "true" ]; then
-            echo "::error::PR #$PR is a draft. Opus review is a completion checkpoint; mark it ready first."
-            exit 1
-          fi
-          # Fork PRs are excluded outright rather than weakening the security
-          # model. `pull_request` from a fork does not receive secrets anyway,
-          # and pull_request_target is deliberately NOT used here.
-          if [ "$head_owner" != "$repo_owner" ]; then
-            echo "::error::PR #$PR originates from fork owner '$head_owner'. Fork review is not supported in v1."
-            exit 1
-          fi
+          python3 - <<'PY_REQUEST'
+          import json, os, re
+          from pathlib import Path
 
-          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
-          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
-          echo "Reviewing $REPO#$PR at head=$head_sha base=$base_sha"
+          def accepted(pr, request, repo, owner, event, comment_id, number):
+              if comment_id:
+                  if event != "issue_comment" or not isinstance(request, dict):
+                      return False
+                  if (request.get("id") != comment_id
+                      or request.get("user", {}).get("login") != owner
+                      or request.get("issue_url") != f"https://api.github.com/repos/{repo}/issues/{number}"
+                      or re.fullmatch(r"@claude(?: review)?\s*", request.get("body", ""), re.I) is None):
+                      return False
+              return (pr.get("state") == "open" and pr.get("draft") is False
+                  and pr.get("head", {}).get("repo", {}).get("full_name") == repo
+                  and re.fullmatch(r"[0-9a-f]{40}", pr.get("head", {}).get("sha", "")) is not None
+                  and re.fullmatch(r"[0-9a-f]{40}", pr.get("base", {}).get("sha", "")) is not None)
 
-      - name: Consume trigger label and clear stale verdicts
+          pr = json.loads(Path(os.environ["PR_SNAPSHOT"]).read_text())
+          comment_id = int(os.environ["REQUEST_COMMENT_ID"])
+          request = json.loads(Path(os.environ["REQUEST_SNAPSHOT"]).read_text()) if comment_id else None
+          ok = accepted(pr, request, os.environ["REPO"], os.environ["REPOSITORY_OWNER"],
+                        os.environ["EVENT_NAME"], comment_id, int(os.environ["PR"]))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"accepted={str(ok).lower()}\n")
+              if ok:
+                  out.write(f"head_sha={pr['head']['sha']}\nbase_sha={pr['base']['sha']}\n")
+          print("Review request accepted." if ok else "No review requested: authorization, grammar or PR eligibility did not match.")
+          PY_REQUEST
+
+      - name: Consume legacy trigger and clear advisory verdict labels
+        if: steps.preflight.outputs.accepted == 'true' && inputs.request_comment_id == 0
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -171,6 +186,7 @@ jobs:
   prepare:
     name: Stage review context
     needs: claim
+    if: needs.claim.outputs.accepted == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -190,18 +206,23 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ inputs.pr_number }}
           BASE_SHA: ${{ needs.claim.outputs.base_sha }}
+          HEAD_SHA: ${{ needs.claim.outputs.head_sha }}
         run: |
           set -euo pipefail
           mkdir -p review-context/base-instructions
           cd review-context
 
           gh pr view "$PR" -R "$REPO" \
-            --json number,title,body,author,baseRefName,headRefName,headRefOid,additions,deletions,changedFiles,files,createdAt \
+            --json number,title,body,author,baseRefName,baseRefOid,headRefName,headRefOid,additions,deletions,changedFiles,files,createdAt \
             > pr.json
 
           # Complete diff. Capped so a runaway PR cannot exhaust the context
           # window; the cap is reported to Claude rather than silently applied.
-          gh pr diff "$PR" -R "$REPO" > pr.diff || echo "(diff unavailable)" > pr.diff
+          jq -e --arg head "$HEAD_SHA" --arg base "$BASE_SHA" \
+            '.headRefOid == $head and .baseRefOid == $base' pr.json > /dev/null
+          gh api -H 'Accept: application/vnd.github.diff' \
+            "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" > pr.diff
+          [ -s pr.diff ] || { echo "::error::Frozen diff unavailable"; exit 1; }
           diff_bytes=$(wc -c < pr.diff)
           if [ "$diff_bytes" -gt 1500000 ]; then
             head -c 1500000 pr.diff > pr.diff.trunc
@@ -274,7 +295,7 @@ jobs:
           cd review-context/base-instructions
 
           staged=""
-          for f in AGENTS.md CLAUDE.md README.md; do
+          for f in AGENTS.md AGENT.md CLAUDE.md README.md; do
             # 404 simply means the file does not exist at the base revision.
             if gh api "repos/${REPO}/contents/${f}?ref=${BASE_SHA}" --jq '.content' 2>/dev/null \
                  | base64 -d > "$f" 2>/dev/null && [ -s "$f" ]; then
@@ -313,6 +334,7 @@ jobs:
   review:
     name: Claude Opus deep review
     needs: [claim, prepare]
+    if: needs.claim.outputs.accepted == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -321,13 +343,18 @@ jobs:
       issues: read
       actions: read
     steps:
-      - name: Checkout PR merge state
+      - name: Checkout frozen PR head
         uses: actions/checkout@v6
         with:
-          # No `ref:` override. For a pull_request event this checks out the
-          # merge commit (PR head merged into base), which is what should be
-          # reviewed. Fork heads are already excluded by the claim job.
+          # issue_comment defaults to the default branch, so a ref is mandatory.
+          ref: ${{ needs.claim.outputs.head_sha }}
+          persist-credentials: false
           fetch-depth: 0
+
+      - name: Verify candidate before export
+        env:
+          HEAD_SHA: ${{ needs.claim.outputs.head_sha }}
+        run: test "$(git rev-parse HEAD)" = "$HEAD_SHA"
 
       - name: Download review context
         uses: actions/download-artifact@v4
@@ -337,7 +364,7 @@ jobs:
 
       - name: Claude Opus review
         id: review
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@6c690188da61cf16ee7debb28383ba67f02abb4c
         timeout-minutes: ${{ inputs.timeout_minutes }}
         # The action fails the step for conditions that do not invalidate the
         # review itself — most notably its guard on a successful result whose
@@ -347,6 +374,8 @@ jobs:
         # so this does NOT weaken fail-closed behaviour: a run with no valid
         # verdict still fails the job.
         continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ''
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # Passing the workflow token stops the action from minting a Claude
@@ -355,13 +384,28 @@ jobs:
           github_token: ${{ github.token }}
           additional_permissions: |
             actions: read
-          # No inline-comment tools are allowed, so nothing is ever buffered.
-          # Setting this to false skips the action's post-run comment-posting
-          # step entirely, so no write-path step executes in this read-only job.
+          # Explicit prompt selects agent mode, with no tracking comment.
+          # No publication tools are available; the job token is read-only.
+          # false means immediate inline posting if a posting tool were allowed;
+          # it is not a permission boundary by itself.
           classify_inline_comments: "false"
+          show_full_output: "false"
+          display_report: "false"
           prompt: |
             You are the heavyweight independent senior engineering reviewer for
             pull request #${{ inputs.pr_number }} in ${{ github.repository }}.
+
+            Frozen head: ${{ needs.claim.outputs.head_sha }}.
+            Frozen base: ${{ needs.claim.outputs.base_sha }}.
+            Inspect this exact head, not an event-default checkout or moving ref.
+            Report base/head integration limits explicitly.
+
+            Independence is assessed separately from the bot account. For a
+            Dependabot PR, identify the preparer family and any actual candidate,
+            test or packet contributions. A Claude-prepared candidate cannot
+            qualify through this Claude route; missing attribution is unknown.
+            Do not infer served model or independence from names in comments.
+            Never claim independent-review qualification from this workflow alone.
 
             Another agent (typically Cursor) implemented this change. CodeRabbit
             may already have supplied routine review.
@@ -493,6 +537,15 @@ jobs:
             bot merely because it commented first, and do not repeat findings
             that are already resolved.
 
+            ## Test changes and limits
+
+            List added/changed/removed/renamed/skipped tests, or explicit none;
+            state intent, replacement coverage and unchanged regressions.
+            No tests or builds may be run. If required evidence/source is absent,
+            incomplete or inconsistent, return UNABLE_TO_VERIFY, never PASS.
+            Credentials/config, .git, private data, recordings and trader-memory
+            doctrine are outside review scope. Do not read them or request access.
+
             ## CI
 
             CI passing is evidence, not proof of correctness. CI failing should
@@ -570,8 +623,11 @@ jobs:
 
                 CLAUDE_REVIEW_RESULT: CHANGES_REQUESTED
 
+            For missing evidence return CLAUDE_REVIEW_RESULT: UNABLE_TO_VERIFY
+            and result UNABLE_TO_VERIFY. A report is advisory until its exact-head
+            binding, observed model evidence and family independence are assessed.
             Emit PASS only when there are zero remaining P0, P1, and P2 findings.
-            Otherwise emit CHANGES_REQUESTED. Never emit both.
+            Otherwise emit CHANGES_REQUESTED, except missing evidence is UNABLE_TO_VERIFY. Emit one result only.
 
             Set the `result` field to the same verdict, and fill `counts` with
             the number of findings at each severity. `spec_issue` should be the
@@ -585,9 +641,11 @@ jobs:
             --effort ${{ inputs.effort }}
             --max-turns ${{ inputs.max_turns }}
             --add-dir /tmp/review-context
-            --allowedTools "Read,Glob,Grep,LS,Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git blame:*),Bash(git status),Bash(git rev-parse:*),mcp__github_ci__get_ci_status,mcp__github_ci__get_workflow_run_details,mcp__github_ci__download_job_log"
-            --disallowedTools "Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Bash(git push:*),Bash(git commit:*),Bash(git add:*),Bash(git rm:*),Bash(gh:*),Bash(curl:*),Bash(rm:*)"
-            --json-schema '{"type":"object","properties":{"result":{"type":"string","enum":["PASS","CHANGES_REQUESTED"]},"review_markdown":{"type":"string","minLength":300},"spec_issue":{"type":"string"},"counts":{"type":"object","properties":{"p0":{"type":"integer"},"p1":{"type":"integer"},"p2":{"type":"integer"},"p3":{"type":"integer"}},"required":["p0","p1","p2","p3"]},"findings":{"type":"array","items":{"type":"object","properties":{"severity":{"type":"string","enum":["P0","P1","P2","P3"]},"location":{"type":"string"},"problem":{"type":"string"},"failure_mode":{"type":"string"},"why":{"type":"string"},"fix":{"type":"string"}},"required":["severity","problem"]}}},"required":["result","review_markdown","counts"]}'
+            --safe-mode
+            --restricted
+            --tools "Read,Glob,Grep"
+            --disallowedTools "mcp__*,Read(./.git/**),Read(./.env*),Read(./data/**),Read(./private/**),Read(./recordings/**),Read(./docs/trader-memory/**)"
+            --json-schema '{"type":"object","properties":{"result":{"type":"string","enum":["PASS","CHANGES_REQUESTED","UNABLE_TO_VERIFY"]},"review_markdown":{"type":"string","minLength":300},"spec_issue":{"type":"string"},"counts":{"type":"object","properties":{"p0":{"type":"integer"},"p1":{"type":"integer"},"p2":{"type":"integer"},"p3":{"type":"integer"}},"required":["p0","p1","p2","p3"]},"findings":{"type":"array","items":{"type":"object","properties":{"severity":{"type":"string","enum":["P0","P1","P2","P3"]},"location":{"type":"string"},"problem":{"type":"string"},"failure_mode":{"type":"string"},"why":{"type":"string"},"fix":{"type":"string"}},"required":["severity","problem"]}}},"required":["result","review_markdown","counts"]}'
 
       # An artifact carries the payload rather than a job output: the review can
       # approach 40 KB of arbitrary markdown, and artifacts impose no escaping,
@@ -601,11 +659,68 @@ jobs:
           CONCLUSION: ${{ steps.review.outputs.conclusion }}
           EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
           REVIEW_OUTCOME: ${{ steps.review.outcome }}
+          REQUESTED_MODEL: ${{ inputs.model }}
+          REVIEW_SESSION_ID: ${{ steps.review.outputs.session_id }}
+          HEAD_SHA: ${{ needs.claim.outputs.head_sha }}
+          BASE_SHA: ${{ needs.claim.outputs.base_sha }}
         run: |
           set -uo pipefail
           mkdir -p review-result
           printf '%s' "${STRUCTURED:-}" > review-result/structured_output.json
           printf '%s' "${CONCLUSION:-unknown}" > review-result/conclusion.txt
+          python3 - <<'PY_EVIDENCE'
+          import json, os
+          from pathlib import Path
+          dest = Path("review-result")
+          raw = os.environ.get("STRUCTURED", "")
+          action_raw = raw
+          payload = None
+          origin = "action structured_output"
+          try:
+              payload = json.loads(raw)
+          except (ValueError, TypeError):
+              pass
+          messages = []
+          execution = os.environ.get("EXECUTION_FILE", "")
+          if execution and Path(execution).is_file():
+              try:
+                  messages = json.loads(Path(execution).read_text())
+              except (ValueError, OSError):
+                  pass
+          if not isinstance(messages, list):
+              messages = []
+          results = [m for m in messages if isinstance(m, dict) and m.get("type") == "result"]
+          result = results[-1] if results else {}
+          def has_shape(value):
+              # Match jq's existing recovery predicate: only null and false are falsey.
+              return isinstance(value, dict) and all(
+                  key in value and value[key] is not None and value[key] is not False
+                  for key in ("result", "review_markdown", "counts")
+              )
+          if not has_shape(payload) and isinstance(result.get("structured_output"), dict):
+              payload = result["structured_output"]
+              raw = json.dumps(payload, ensure_ascii=False)
+              origin = "SDK result structured_output"
+          # Retain the original before existing placeholder recovery or hydration.
+          (dest / "original-action-output.json").write_text(action_raw, encoding="utf-8")
+          (dest / "original-structured-output.json").write_text(raw, encoding="utf-8")
+          if isinstance(payload, dict) and isinstance(payload.get("review_markdown"), str):
+              (dest / "original-review.md").write_text(payload["review_markdown"], encoding="utf-8")
+          models = set()
+          for m in messages:
+              value = m.get("message", {}).get("model") if isinstance(m, dict) and isinstance(m.get("message"), dict) else None
+              if isinstance(value, str):
+                  models.add(value)
+          usage = result.get("modelUsage", {})
+          if isinstance(usage, dict):
+              models.update(k for k in usage if isinstance(k, str))
+          metadata = {"requested_model": os.environ["REQUESTED_MODEL"],
+              "session_id": os.environ.get("REVIEW_SESSION_ID") or result.get("session_id"),
+              "head": os.environ["HEAD_SHA"], "base": os.environ["BASE_SHA"],
+              "reported_models": sorted(models), "original_source": origin,
+              "identity_strength": "SDK/provider-reported; independent qualification is separate"}
+          (dest / "model-observation.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+          PY_EVIDENCE
 
           # Shape: the JSON has the required keys. Usable: review_markdown is a
           # real review, not Claude Code's "(see structured field)" pointer.
@@ -625,13 +740,13 @@ jobs:
               or (($text | length) < 80)
               or (($text | test("CLAUDE_REVIEW_RESULT:")) | not);
           def has_marker:
-            md | test("CLAUDE_REVIEW_RESULT:\\s*(PASS|CHANGES_REQUESTED)");
+            md | test("CLAUDE_REVIEW_RESULT:\\s*(PASS|CHANGES_REQUESTED|UNABLE_TO_VERIFY)");
           def blocking: ((.counts.p0 // 0) + (.counts.p1 // 0) + (.counts.p2 // 0));
           def has_finding_body:
             blocking == 0
             or (md | test("Severity:"))
             or ((.findings // []) | length) > 0;
-          (.result == "PASS" or .result == "CHANGES_REQUESTED")
+          (.result == "PASS" or .result == "CHANGES_REQUESTED" or .result == "UNABLE_TO_VERIFY")
           and (.counts | type == "object")
           and (.counts | has("p0") and has("p1") and has("p2") and has("p3"))
           and (md | length) > 0
@@ -778,7 +893,7 @@ jobs:
         with:
           name: opus-review-result
           path: review-result/
-          retention-days: 3
+          retention-days: 30
           if-no-files-found: warn
 
   # ==========================================================================
@@ -788,7 +903,7 @@ jobs:
   publish:
     name: Publish review and apply verdict
     needs: [claim, prepare, review]
-    if: always() && needs.claim.result == 'success'
+    if: always() && needs.claim.result == 'success' && needs.claim.outputs.accepted == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -809,16 +924,37 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ needs.claim.outputs.head_sha }}
+          BASE_SHA: ${{ needs.claim.outputs.base_sha }}
+          CURRENT_SNAPSHOT: /tmp/publish-current.json
+          REQUEST_COMMENT_ID: ${{ inputs.request_comment_id }}
+          ERROR_LABEL: ${{ inputs.error_label }}
           PASS_LABEL: ${{ inputs.pass_label }}
           CHANGES_LABEL: ${{ inputs.changes_label }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
 
+
           if ! jq -e . review-result/structured_output.json >/dev/null 2>&1; then
             echo "::error::Review result artifact is missing or not valid JSON. Not treating this as PASS."
             exit 1
           fi
+
+          python3 - <<'PY_COUNTS'
+          import json, sys
+          from pathlib import Path
+          payload = json.loads(Path("review-result/structured_output.json").read_text())
+          counts = payload.get("counts") if isinstance(payload, dict) else None
+          # Reject booleans, strings, negatives and arithmetic overflow before the shell
+          # consumes model-controlled values. Four bounded counts fit signed 64-bit math.
+          limit = (2**63 - 1) // 4
+          if not isinstance(counts, dict) or any(
+              type(counts.get(key)) is not int or not 0 <= counts[key] <= limit
+              for key in ("p0", "p1", "p2", "p3")
+          ):
+              print("::error::Invalid review counts; refusing publication.")
+              sys.exit(1)
+          PY_COUNTS
 
           result=$(jq -r '.result' review-result/structured_output.json)
           spec=$(jq -r '.spec_issue // "none"' review-result/structured_output.json)
@@ -827,7 +963,7 @@ jobs:
           p2=$(jq -r '.counts.p2' review-result/structured_output.json)
           p3=$(jq -r '.counts.p3' review-result/structured_output.json)
 
-          if [ "$result" != "PASS" ] && [ "$result" != "CHANGES_REQUESTED" ]; then
+          if [ "$result" != "PASS" ] && [ "$result" != "CHANGES_REQUESTED" ] && [ "$result" != "UNABLE_TO_VERIFY" ]; then
             echo "::error::Unrecognized review result '$result'."
             exit 1
           fi
@@ -840,7 +976,7 @@ jobs:
               exit 1
               ;;
           esac
-          if ! printf '%s' "$md" | grep -qE 'CLAUDE_REVIEW_RESULT: (PASS|CHANGES_REQUESTED)'; then
+          if ! printf '%s' "$md" | grep -qE 'CLAUDE_REVIEW_RESULT: (PASS|CHANGES_REQUESTED|UNABLE_TO_VERIFY)'; then
             echo "::error::review_markdown is missing the CLAUDE_REVIEW_RESULT marker. Refusing to post a verdict."
             exit 1
           fi
@@ -864,7 +1000,7 @@ jobs:
             echo "<!-- claude-opus-review -->"
             echo "## Claude Opus deep review"
             echo
-            echo "Reviewed \`${HEAD_SHA}\` · spec ${spec} · findings P0=${p0} P1=${p1} P2=${p2} P3=${p3}"
+            echo "Reviewed \`${HEAD_SHA}\` against base \`${BASE_SHA}\` · spec ${spec} · findings P0=${p0} P1=${p1} P2=${p2} P3=${p3}"
             echo
             echo "---"
             echo
@@ -873,15 +1009,36 @@ jobs:
             echo
             echo
             echo "---"
-            echo "_Independent Opus review. Advisory only — merge authority remains with the repository owner._ · [run log](${RUN_URL})"
+            echo "_Opus report; independent-review qualification is separate. Advisory only — merge authority remains with the repository owner._ · [run log](${RUN_URL})"
           } > /tmp/review-comment.md
+
+          # Stale/closed candidates retain their original artifact, but
+          # receive no current verdict comment or label.
+          gh api "repos/${REPO}/pulls/${PR}" > "$CURRENT_SNAPSHOT"
+          if ! python3 - <<'PY_FRESHNESS'
+          import json, os, sys
+          from pathlib import Path
+          pr = json.loads(Path(os.environ["CURRENT_SNAPSHOT"]).read_text())
+          ok = (pr.get("state") == "open" and pr.get("head", {}).get("sha") == os.environ["HEAD_SHA"]
+                and pr.get("base", {}).get("sha") == os.environ["BASE_SHA"])
+          sys.exit(0 if ok else 1)
+          PY_FRESHNESS
+          then
+            echo "Stale review: head/base/state moved; original report retained, no verdict published." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
 
           gh pr comment "$PR" -R "$REPO" --body-file /tmp/review-comment.md
 
-          if [ "$result" = "PASS" ]; then
-            gh pr edit "$PR" -R "$REPO" --add-label "$PASS_LABEL"
-          else
-            gh pr edit "$PR" -R "$REPO" --add-label "$CHANGES_LABEL"
+          # Mention reports are revision-bound, not a new label gate.
+          if [ "$REQUEST_COMMENT_ID" = "0" ]; then
+            if [ "$result" = "PASS" ]; then
+              gh pr edit "$PR" -R "$REPO" --add-label "$PASS_LABEL"
+            elif [ "$result" = "CHANGES_REQUESTED" ]; then
+              gh pr edit "$PR" -R "$REPO" --add-label "$CHANGES_LABEL"
+            else
+              gh pr edit "$PR" -R "$REPO" --add-label "$ERROR_LABEL"
+            fi
           fi
 
           echo "### Opus review: $result (P0=$p0 P1=$p1 P2=$p2 P3=$p3)" >> "$GITHUB_STEP_SUMMARY"
@@ -898,13 +1055,39 @@ jobs:
           PR: ${{ inputs.pr_number }}
           ERROR_LABEL: ${{ inputs.error_label }}
           TRIGGER_LABEL: ${{ inputs.trigger_label }}
+          HEAD_SHA: ${{ needs.claim.outputs.head_sha }}
+          BASE_SHA: ${{ needs.claim.outputs.base_sha }}
+          CURRENT_SNAPSHOT: /tmp/publish-current.json
+          REQUEST_COMMENT_ID: ${{ inputs.request_comment_id }}
           PREPARE_RESULT: ${{ needs.prepare.result }}
           REVIEW_RESULT: ${{ needs.review.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          set -uo pipefail
-          gh pr edit "$PR" -R "$REPO" --add-label "$ERROR_LABEL" || true
+          set -euo pipefail
+          # Stale/closed candidates retain their original artifact, but
+          # receive no current verdict comment or label.
+          gh api "repos/${REPO}/pulls/${PR}" > "$CURRENT_SNAPSHOT"
+          if ! python3 - <<'PY_FRESHNESS'
+          import json, os, sys
+          from pathlib import Path
+          pr = json.loads(Path(os.environ["CURRENT_SNAPSHOT"]).read_text())
+          ok = (pr.get("state") == "open" and pr.get("head", {}).get("sha") == os.environ["HEAD_SHA"]
+                and pr.get("base", {}).get("sha") == os.environ["BASE_SHA"])
+          sys.exit(0 if ok else 1)
+          PY_FRESHNESS
+          then
+            echo "Stale review: head/base/state moved; original report retained, no verdict published." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
 
+          if [ "$REQUEST_COMMENT_ID" = "0" ]; then
+            gh pr edit "$PR" -R "$REPO" --add-label "$ERROR_LABEL" || true
+          fi
+
+          request_again="comment @claude again"
+          if [ "$REQUEST_COMMENT_ID" = "0" ]; then
+            request_again="apply the ${TRIGGER_LABEL} label again"
+          fi
           cat > /tmp/review-error.md <<EOF
           <!-- claude-opus-review -->
           ## Claude Opus deep review — did not complete
@@ -913,7 +1096,7 @@ jobs:
           **This is not a pass.**
 
           No verdict label was applied. Investigate the [run log](${RUN_URL}), then re-request the
-          review by applying the \`${TRIGGER_LABEL}\` label again.
+          review: ${request_again}.
           EOF
 
           gh pr comment "$PR" -R "$REPO" --body-file /tmp/review-error.md || true
